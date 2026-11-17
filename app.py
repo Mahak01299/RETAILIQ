@@ -21,15 +21,26 @@ client = genai.Client(
 )
 
 # Change the model name in secrets.toml (GEMINI_MODEL) if needed
-MODEL_NAME = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME = st.secrets.get("GEMINI_MODEL", "gemini-3.5-flash")
 # If the main model is slow/overloaded, these are tried next
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
 
 def ask_gemini(prompt):
     """Try the main model, then fallback models, 2 attempts each."""
     import time
     models = [MODEL_NAME] + [m for m in FALLBACK_MODELS if m != MODEL_NAME]
+    # Also add any flash models actually available for this API key
+    try:
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            if "flash" in name and name not in models and not any(
+                x in name for x in ("image", "tts", "live", "audio", "embedding")
+            ):
+                models.append(name)
+    except Exception:
+        pass
+    models = models[:6]
     last_error = None
     for model in models:
         for attempt in range(2):
@@ -1082,3 +1093,4 @@ Give a concise, accurate and useful answer.
             st.write(f"Data source: SQLite database `retailiq.db`, table `sales` ({rows:,} rows).")
     except Exception as e:
         st.error(f"Unable to process dataset: {e}")
+
