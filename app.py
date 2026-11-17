@@ -1,19 +1,53 @@
+import sqlite3
 from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 from google import genai
+from google.genai import types
 from openpyxl import load_workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import streamlit as st
-from google.genai import types
-import pandas as pd
-import plotly.express as px
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LinearRegression
+
+# Gemini client (key is read from .streamlit/secrets.toml)
 client = genai.Client(
     api_key=st.secrets["GEMINI_API_KEY"],
-    http_options=types.HttpOptions(timeout=120000)
+    http_options=types.HttpOptions(timeout=40000)  # 40 sec per try
 )
 
-MODEL_NAME = "gemini-3.8-flash"
+# Change the model name in secrets.toml (GEMINI_MODEL) if needed
+MODEL_NAME = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
+# If the main model is slow/overloaded, these are tried next
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+
+
+def ask_gemini(prompt):
+    """Try the main model, then fallback models, 2 attempts each."""
+    import time
+    models = [MODEL_NAME] + [m for m in FALLBACK_MODELS if m != MODEL_NAME]
+    last_error = None
+    for model in models:
+        for attempt in range(2):
+            try:
+                cfg = {"max_output_tokens": 1024}
+                if "gemini-3" in model:
+                    cfg["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(**cfg),
+                )
+                if resp.text:
+                    return resp.text
+            except Exception as e:
+                last_error = e
+                time.sleep(1.5)
+    raise last_error or RuntimeError("No response from AI")
 
 # Page settings
 st.set_page_config(
@@ -26,6 +60,28 @@ st.set_page_config(
 st.title("📊 RetailIQ")
 st.caption("AI-Powered Retail Business Intelligence Platform")
 st.divider()
+
+# ---------------- ADMIN MODULE: login + usage monitoring ----------------
+if "usage" not in st.session_state:
+    st.session_state.usage = {"files_uploaded": 0, "ai_questions": 0, "reports_generated": 0}
+if "auth" not in st.session_state:
+    st.session_state.auth = False
+
+if not st.session_state.auth:
+    st.subheader("🔐 Login")
+    st.caption("Demo login. Admin password is stored in secrets (ADMIN_PASSWORD).")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if password == st.secrets.get("ADMIN_PASSWORD", "admin123"):
+            st.session_state.auth = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+    st.stop()
+
+if st.sidebar.button("Logout"):
+    st.session_state.auth = False
+    st.rerun()
 
 # Upload dataset
 st.sidebar.header("Upload Retail Data")
@@ -82,6 +138,13 @@ if uploaded_file is not None:
         df = df.dropna(
             subset=["transaction_date", "sales_amount"]
         )
+
+        # DATABASE: store uploaded data in SQLite (can be swapped to MySQL later)
+        if st.session_state.get("last_file") != uploaded_file.name:
+            st.session_state.last_file = uploaded_file.name
+            st.session_state.usage["files_uploaded"] += 1
+            with sqlite3.connect("retailiq.db") as conn:
+                df.to_sql("sales", conn, if_exists="replace", index=False)
 
         # Sidebar filters
         st.sidebar.subheader("Filters")
@@ -184,6 +247,21 @@ if uploaded_file is not None:
 
         st.plotly_chart(fig3, width="stretch")
 
+        # City-wise performance (real city column from the CSV)
+        st.subheader("City-wise Performance")
+        if "city" in filtered.columns:
+            city_sales = (
+                filtered.groupby("city", as_index=False)["sales_amount"]
+                .sum().sort_values("sales_amount", ascending=False)
+            )
+            st.plotly_chart(
+                px.bar(city_sales.head(10), x="city", y="sales_amount",
+                       title="Top 10 Cities by Revenue", color="city"),
+                width="stretch"
+            )
+        else:
+            st.info("Add a 'city' column to the CSV to view city-wise performance.")
+
         # Top products
         st.subheader("Top Selling Products")
 
@@ -225,6 +303,29 @@ if uploaded_file is not None:
             )
         else:
             st.info("Add a customer_segment column to the CSV to view segment-level customer insights.")
+
+        # AI customer clustering: RFM + KMeans
+        st.markdown("**AI Customer Clusters (RFM + KMeans)**")
+        snapshot = filtered["transaction_date"].max()
+        rfm = filtered.groupby("customer_id").agg(
+            Recency=("transaction_date", lambda x: (snapshot - x.max()).days),
+            Frequency=("transaction_id", "nunique"),
+            Monetary=("sales_amount", "sum"),
+        )
+        if len(rfm) >= 3:
+            scaled = (rfm - rfm.mean()) / rfm.std().replace(0, 1)
+            rfm["Cluster"] = "Cluster " + KMeans(
+                n_clusters=3, n_init=10, random_state=42
+            ).fit_predict(scaled.fillna(0)).astype(str)
+            st.plotly_chart(
+                px.scatter(rfm.reset_index(), x="Frequency", y="Monetary",
+                           color="Cluster", hover_data=["customer_id", "Recency"],
+                           title="Customer Segments"),
+                width="stretch"
+            )
+            st.caption("Customers grouped by Recency, Frequency and Monetary value using KMeans.")
+        else:
+            st.info("At least 3 customers are needed for clustering.")
 
         # Inventory status (uses actual stock data only when provided)
         st.subheader("Inventory Status")
@@ -275,16 +376,26 @@ if uploaded_file is not None:
                 st.write(f"• Revenue {direction} by **{abs(change):.1f}%** in the latest month versus the previous month; investigate the drivers.")
             st.caption("These are rule-based observations from the selected data, not generated AI recommendations.")
         with forecast_col:
-            st.markdown("**Next-month demand estimate**")
-            if len(monthly_sales) >= 2:
-                demand_history = filtered.groupby("month", as_index=False)["quantity"].sum().sort_values("month")
-                recent = demand_history["quantity"].tail(3)
-                estimated_units = recent.mean()
-                next_month = (pd.Period(monthly_sales["month"].max(), freq="M") + 1).strftime("%Y-%m")
-                st.metric(f"Estimated units for {next_month}", f"{estimated_units:,.0f}")
-                st.caption("Simple estimate: average units sold over the latest three available months. This is a baseline, not a trained forecasting model.")
+            st.markdown("**Sales Forecast (next 3 months)**")
+            if len(monthly_sales) >= 4:
+                y = monthly_sales["sales_amount"].values
+                X = np.arange(len(y)).reshape(-1, 1)
+                model = LinearRegression().fit(X, y)
+                preds = np.maximum(model.predict(np.arange(len(y), len(y) + 3).reshape(-1, 1)), 0)
+                last_period = pd.Period(monthly_sales["month"].max(), freq="M")
+                future_months = [(last_period + i).strftime("%Y-%m") for i in range(1, 4)]
+                forecast_df = pd.concat([
+                    monthly_sales.assign(type="Actual"),
+                    pd.DataFrame({"month": future_months, "sales_amount": preds, "type": "Forecast"}),
+                ])
+                st.plotly_chart(
+                    px.line(forecast_df, x="month", y="sales_amount", color="type",
+                            markers=True, title="Actual vs Forecast Revenue"),
+                    width="stretch"
+                )
+                st.caption(f"Linear Regression trend model (R² = {model.score(X, y):.2f}). Indicative forecast, not a guarantee.")
             else:
-                st.info("At least two months of sales data are needed to show a basic demand estimate.")
+                st.info("At least 4 months of sales data are needed for the forecast.")
 
         # =====================================
         # RETAILIQ AI BUSINESS COPILOT
@@ -320,6 +431,7 @@ if uploaded_file is not None:
 
             if user_question:
 
+                st.session_state.usage["ai_questions"] += 1
                 st.session_state.retailiq_chat_history.append({
                     "role": "user",
                     "content": user_question
@@ -378,7 +490,7 @@ if uploaded_file is not None:
 
                 Important limitations:
                 - Only uploaded and currently filtered dataset is available.
-                - City allocation and profit/cost figures are simulated.
+                - Profit/cost figures are illustrative assumptions, not real data.
                 - Do not claim simulated figures are actual business facts.
                 - Do not invent missing business information.
                 """
@@ -431,19 +543,9 @@ Give a concise, accurate and useful answer.
 
                         try:
                            
-                            response = client.models.generate_content(
-                                model=MODEL_NAME,
-                                contents=ai_prompt,
-                                config=types.GenerateContentConfig(
-                                    thinking_config=types.ThinkingConfig(
-                                        thinking_level="LOW"
-                                    ),
-                                    max_output_tokens=512
-                                )
-)
+                            answer = ask_gemini(ai_prompt)
 
 
-                            answer = response.text
 
                             if not answer:
                                 answer = "Sorry, I could not generate a response."
@@ -528,30 +630,9 @@ Give a concise, accurate and useful answer.
 
         # SIMULATED DEMO DATA
         st.warning(
-            "City allocation, product costs and expenses below are "
-            "simulated assumptions for project demonstration only."
+            "Product costs and expenses in the Profit/Loss sheet are "
+            "illustrative assumptions (70% cost, 10% expenses) for demonstration only."
         )
-
-        # Demo city mapping by region
-        city_mapping = {
-            "North": ["Delhi", "Jaipur", "Chandigarh"],
-            "South": ["Bengaluru", "Chennai", "Hyderabad"],
-            "East": ["Kolkata", "Bhubaneswar", "Guwahati"],
-            "West": ["Mumbai", "Pune", "Ahmedabad"],
-            "Central": ["Bhopal", "Indore", "Raipur"]
-        }
-        # Fast vectorized Demo City allocation
-        filtered["Demo City"] = "Other Demo City"
-
-       
-        for region, cities in city_mapping.items():
-            mask = filtered["region"].eq(region)
-            row_indexes = filtered.index[mask]
-
-            filtered.loc[mask, "Demo City"] = [
-                cities[i % len(cities)] for i in row_indexes
-            ]
-
 
         # Illustrative cost and expense assumptions
         filtered["Estimated Product Cost"] = (
@@ -588,16 +669,18 @@ Give a concise, accurate and useful answer.
                 units
             ]
         })
-        # City-wise Sales Report
-        city_report = (
-            filtered.groupby("Demo City", as_index=False)
-            .agg(
-                Revenue=("sales_amount", "sum"),
-                Units_Sold=("quantity", "sum"),
-                Transactions=("transaction_id", "nunique")
+        # City-wise Sales Report (only if a real city column exists)
+        city_report = None
+        if "city" in filtered.columns:
+            city_report = (
+                filtered.groupby("city", as_index=False)
+                .agg(
+                    Revenue=("sales_amount", "sum"),
+                    Units_Sold=("quantity", "sum"),
+                    Transactions=("transaction_id", "nunique")
+                )
+                .sort_values("Revenue", ascending=False)
             )
-            .sort_values("Revenue", ascending=False)
-        )
 
         # Profit and Loss Report
         profit_loss_report = pd.DataFrame({
@@ -619,8 +702,7 @@ Give a concise, accurate and useful answer.
         if st.button("📊 Generate Excel Report"):
             
             # Excel report creation
-            from io import BytesIO
-
+            st.session_state.usage["reports_generated"] += 1
             excel_buffer = BytesIO()
 
             with pd.ExcelWriter(
@@ -655,38 +737,18 @@ Give a concise, accurate and useful answer.
                 filtered.to_excel(
                     writer, sheet_name="Filtered Data", index=False
                 )
-                city_report.to_excel(
-                    writer,
-                    sheet_name="City Wise Sales",
-                    index=False
-                )
+                if city_report is not None:
+                    city_report.to_excel(
+                        writer, sheet_name="City Wise Sales", index=False
+                    )
 
                 profit_loss_report.to_excel(
                     writer,
                     sheet_name="Profit Loss",
                     index=False
                 )
-                # City report only if city column exists
-                if "city" in filtered.columns:
-                    city_report = (
-                        filtered.groupby("city", as_index=False)
-                        .agg(
-                            Revenue=("sales_amount", "sum"),
-                            Transactions=("transaction_id", "nunique"),
-                            Units_Sold=("quantity", "sum")
-                        )
-                        .sort_values("Revenue", ascending=False)
-                    )
-
-                    city_report.to_excel(
-                        writer, sheet_name="City Report", index=False
-                    )
 
             # Add editable charts to Excel sheets
-            from openpyxl.chart import BarChart, LineChart, Reference
-
-            from openpyxl import load_workbook
-
             excel_buffer.seek(0)
             wb = load_workbook(excel_buffer)
 
@@ -732,17 +794,18 @@ Give a concise, accurate and useful answer.
             ws.add_chart(chart, "G2")
 
             # City-wise Sales Chart
-            ws = wb["City Wise Sales"]
-            chart = BarChart()
-            chart.title = "Demo City-wise Revenue"
-            chart.add_data(
-                Reference(ws, min_col=2, min_row=1, max_row=ws.max_row),
-                titles_from_data=True
-            )
-            chart.set_categories(
-                Reference(ws, min_col=1, min_row=2, max_row=ws.max_row)
-            )
-            ws.add_chart(chart, "G2")
+            if "City Wise Sales" in wb.sheetnames:
+                ws = wb["City Wise Sales"]
+                chart = BarChart()
+                chart.title = "City-wise Revenue"
+                chart.add_data(
+                    Reference(ws, min_col=2, min_row=1, max_row=ws.max_row),
+                    titles_from_data=True
+                )
+                chart.set_categories(
+                    Reference(ws, min_col=1, min_row=2, max_row=ws.max_row)
+                )
+                ws.add_chart(chart, "G2")
 
             # Monthly Revenue Trend
             ws = wb["Monthly Growth"]
@@ -898,9 +961,6 @@ Give a concise, accurate and useful answer.
             ws_dash.column_dimensions["E"].width = 20
 
             # Professional Excel Report Formatting
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-            from openpyxl.utils import get_column_letter
-
             header_fill = PatternFill(
                 fill_type="solid",
                 fgColor="17365D"
@@ -1009,6 +1069,16 @@ Give a concise, accurate and useful answer.
             )
 
             st.success("RetailIQ dashboard and business reports loaded successfully!")
+
+        # ADMIN PANEL
+        with st.expander("🛠️ Admin Panel (Platform Usage & Data Source)"):
+            u = st.session_state.usage
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Files uploaded", u["files_uploaded"])
+            a2.metric("AI questions asked", u["ai_questions"])
+            a3.metric("Reports generated", u["reports_generated"])
+            with sqlite3.connect("retailiq.db") as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM sales").fetchone()[0]
+            st.write(f"Data source: SQLite database `retailiq.db`, table `sales` ({rows:,} rows).")
     except Exception as e:
         st.error(f"Unable to process dataset: {e}")
-
