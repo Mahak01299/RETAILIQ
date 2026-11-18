@@ -64,7 +64,8 @@ def ask_gemini(prompt):
 st.set_page_config(
     page_title="RetailIQ",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
 # Custom title
@@ -81,34 +82,39 @@ if "auth" not in st.session_state:
 if not st.session_state.auth:
     st.subheader("🔐 Login")
     st.caption("Demo login. Admin password is stored in secrets (ADMIN_PASSWORD).")
-    password = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if password == st.secrets.get("ADMIN_PASSWORD", "admin123"):
+    with st.form("login_form"):
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", use_container_width=True)
+    if submitted:
+        if password.strip() == str(st.secrets.get("ADMIN_PASSWORD", "admin123")).strip():
             st.session_state.auth = True
             st.rerun()
         else:
             st.error("Wrong password")
     st.stop()
 
-if st.sidebar.button("Logout"):
-    st.session_state.auth = False
-    st.rerun()
+# Upload section is on the MAIN page so it works on mobile too
+up_col, out_col = st.columns([5, 1])
+with out_col:
+    if st.button("Logout"):
+        st.session_state.auth = False
+        st.rerun()
 
-# Upload dataset
-st.sidebar.header("Upload Retail Data")
-st.sidebar.divider()
+with up_col:
+    st.subheader("📁 Upload Retail Data")
 
-st.sidebar.subheader("🤖 AI Business Copilot")
-
-ai_access = st.sidebar.toggle(
-    "Enable AI Assistant",
-    value=True
-)
-
-uploaded_file = st.sidebar.file_uploader(
+uploaded_file = st.file_uploader(
     "Upload CSV File",
     type=["csv"]
 )
+
+ai_access = st.toggle(
+    "🤖 Enable AI Business Copilot",
+    value=True
+)
+
+if uploaded_file is None:
+    st.info("Upload a CSV file above to see the dashboard. A sample file is available in the project repo (sample_retail_data.csv).")
 
 if uploaded_file is not None:
 
@@ -158,21 +164,20 @@ if uploaded_file is not None:
                 df.to_sql("sales", conn, if_exists="replace", index=False)
 
         # Sidebar filters
-        st.sidebar.subheader("Filters")
+        with st.expander("🔎 Filters (Region / Category)", expanded=False):
+            regions = sorted(df["region"].dropna().unique())
+            selected_regions = st.multiselect(
+                "Select Region",
+                regions,
+                default=regions
+            )
 
-        regions = sorted(df["region"].dropna().unique())
-        selected_regions = st.sidebar.multiselect(
-            "Select Region",
-            regions,
-            default=regions
-        )
-
-        categories = sorted(df["category"].dropna().unique())
-        selected_categories = st.sidebar.multiselect(
-            "Select Category",
-            categories,
-            default=categories
-        )
+            categories = sorted(df["category"].dropna().unique())
+            selected_categories = st.multiselect(
+                "Select Category",
+                categories,
+                default=categories
+            )
 
         filtered = df[
             df["region"].isin(selected_regions)
@@ -352,7 +357,7 @@ if uploaded_file is not None:
                 .agg(Available_Stock=(stock_column, "min"), Units_Sold=("quantity", "sum"))
                 .sort_values("Available_Stock")
             )
-            low_stock_limit = st.sidebar.number_input(
+            low_stock_limit = st.number_input(
                 "Low stock alert threshold", min_value=1, max_value=1000, value=10
             )
             low_stock = inventory[inventory["Available_Stock"] <= low_stock_limit]
