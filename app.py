@@ -1,3 +1,5 @@
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from io import BytesIO
 
@@ -145,58 +147,83 @@ def stream_openai(prompt, api_key):
             yield ev.choices[0].delta.content
 
 
-# ---------------- DATABASE: SQLite by default, MySQL if MYSQL_URL is set in secrets ----------------
+# ---------------- DATABASE: built-in SQLite by default, MySQL if MYSQL_URL is set in secrets ----------------
 @st.cache_resource(show_spinner=False)
 def get_engine():
-    """Returns (engine, label). Example MYSQL_URL: mysql+pymysql://user:password@host:3306/dbname"""
-    from sqlalchemy import create_engine, text
+    """Returns (engine, label). engine is None for SQLite (built-in, no extra library needed).
+    MySQL needs: pip install sqlalchemy pymysql, and MYSQL_URL like mysql+pymysql://user:password@host:3306/dbname"""
     try:
         url = st.secrets.get("MYSQL_URL", "")
     except Exception:
         url = ""
     if url:
         try:
+            from sqlalchemy import create_engine, text
             eng = create_engine(url, pool_pre_ping=True)
             with eng.connect() as c:
                 c.execute(text("SELECT 1"))
             return eng, "MySQL"
         except Exception:
             pass  # fall back to SQLite
-    return create_engine("sqlite:///retailiq.db"), "SQLite"
+    return None, "SQLite"
+
+
+@contextmanager
+def db_conn():
+    """Yields a connection that pandas can use (sqlite3 connection or SQLAlchemy connection)."""
+    eng, _ = get_engine()
+    if eng is None:
+        conn = sqlite3.connect("retailiq.db")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        with eng.begin() as conn:
+            yield conn
+
+
+def db_execute(sql, params=None):
+    eng, _ = get_engine()
+    with db_conn() as conn:
+        if eng is None:
+            conn.execute(sql, params or {})
+        else:
+            from sqlalchemy import text
+            conn.execute(text(sql), params or {})
 
 
 def db_save_sales(df):
-    eng, _ = get_engine()
-    df.to_sql("sales", eng, if_exists="replace", index=False, chunksize=2000)
+    with db_conn() as conn:
+        df.to_sql("sales", conn, if_exists="replace", index=False, chunksize=2000)
 
 
 def db_load_sales():
-    from sqlalchemy import inspect
-    eng, _ = get_engine()
-    if "sales" not in inspect(eng).get_table_names():
-        return None
-    return pd.read_sql_table("sales", eng)
+    try:
+        with db_conn() as conn:
+            return pd.read_sql("SELECT * FROM sales", conn)
+    except Exception:
+        return None  # table does not exist yet
 
 
 def log_event(event):
     """Permanent usage log (stored in the database, survives page refresh)."""
-    from sqlalchemy import text
-    eng, _ = get_engine()
     try:
-        with eng.begin() as c:
-            c.execute(text("CREATE TABLE IF NOT EXISTS usage_log (ts VARCHAR(30), event VARCHAR(50))"))
-            c.execute(text("INSERT INTO usage_log (ts, event) VALUES (:t, :e)"),
-                      {"t": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "e": event})
+        db_execute("CREATE TABLE IF NOT EXISTS usage_log (ts VARCHAR(30), event VARCHAR(50))")
+        db_execute("INSERT INTO usage_log (ts, event) VALUES (:t, :e)",
+                   {"t": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "e": event})
     except Exception:
         pass
 
 
 def read_usage_log():
-    eng, _ = get_engine()
     try:
-        return pd.read_sql("SELECT ts, event FROM usage_log ORDER BY ts DESC", eng)
+        with db_conn() as conn:
+            return pd.read_sql("SELECT ts, event FROM usage_log ORDER BY ts DESC", conn)
     except Exception:
         return pd.DataFrame(columns=["ts", "event"])
+
 
 # Page settings
 st.set_page_config(
@@ -1363,9 +1390,10 @@ Give a short, accurate answer (maximum 5-6 lines) unless the user asks for detai
                 a1.metric("Files uploaded", int((usage_log["event"] == "file_upload").sum()))
                 a2.metric("AI questions asked", int((usage_log["event"] == "ai_question").sum()))
                 a3.metric("Total events", len(usage_log))
-                eng, db_name = get_engine()
+                _, db_name = get_engine()
                 try:
-                    n_rows = int(pd.read_sql("SELECT COUNT(*) AS n FROM sales", eng)["n"].iloc[0])
+                    with db_conn() as conn:
+                        n_rows = int(pd.read_sql("SELECT COUNT(*) AS n FROM sales", conn)["n"].iloc[0])
                 except Exception:
                     n_rows = 0
                 st.write(f"Data source: **{db_name}** database, table `sales` ({n_rows:,} rows). Usage is stored permanently in table `usage_log`.")
