@@ -11,53 +11,106 @@ from openpyxl import load_workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from sklearn.cluster import KMeans
-from sklearn.linear_model import LinearRegression
+
+# scikit-learn is optional: if it is blocked/missing (e.g. Windows policy), numpy fallbacks are used
+try:
+    from sklearn.cluster import KMeans as _SkKMeans
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+
+def kmeans_labels(data, k=3, iters=50, seed=42):
+    """Cluster labels using scikit-learn KMeans, or a simple numpy KMeans if unavailable."""
+    data = np.asarray(data, dtype=float)
+    if SKLEARN_OK:
+        return _SkKMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(data)
+    rng = np.random.default_rng(seed)
+    centers = data[rng.choice(len(data), k, replace=False)]
+    for _ in range(iters):
+        dist = ((data[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        labels = dist.argmin(axis=1)
+        new = np.array([data[labels == i].mean(axis=0) if (labels == i).any() else centers[i]
+                        for i in range(k)])
+        if np.allclose(new, centers):
+            break
+        centers = new
+    return labels
+
+
+def linear_trend(y, steps=3):
+    """Least-squares Linear Regression on time index. Returns predictions and R-squared."""
+    y = np.asarray(y, dtype=float)
+    x = np.arange(len(y))
+    slope, intercept = np.polyfit(x, y, 1)
+    fitted = slope * x + intercept
+    ss_res = ((y - fitted) ** 2).sum()
+    ss_tot = ((y - y.mean()) ** 2).sum()
+    r2 = 1 - ss_res / ss_tot if ss_tot else 1.0
+    future = slope * np.arange(len(y), len(y) + steps) + intercept
+    return future, r2
 
 # Gemini client (key is read from .streamlit/secrets.toml)
 client = genai.Client(
     api_key=st.secrets["GEMINI_API_KEY"],
-    http_options=types.HttpOptions(timeout=40000)  # 40 sec per try
+    http_options=types.HttpOptions(timeout=25000)  # 25 sec per try
 )
 
 # Change the model name in secrets.toml (GEMINI_MODEL) if needed
 MODEL_NAME = st.secrets.get("GEMINI_MODEL", "gemini-3.5-flash")
 # If the main model is slow/overloaded, these are tried next
-FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
+FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
 
 
-def ask_gemini(prompt):
-    """Try the main model, then fallback models, 2 attempts each."""
-    import time
-    models = [MODEL_NAME] + [m for m in FALLBACK_MODELS if m != MODEL_NAME]
-    # Also add any flash models actually available for this API key
+@st.cache_resource(show_spinner=False)
+def discover_models():
+    """Flash models available for this API key (looked up only once, only when needed)."""
+    found = []
     try:
         for m in client.models.list():
             name = m.name.replace("models/", "")
-            if "flash" in name and name not in models and not any(
+            if "flash" in name and not any(
                 x in name for x in ("image", "tts", "live", "audio", "embedding")
             ):
-                models.append(name)
+                found.append(name)
     except Exception:
         pass
-    models = models[:6]
+    return found
+
+
+def _stream_one(model, prompt):
+    cfg = {"max_output_tokens": 700}
+    if "gemini-3" in model:
+        cfg["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
+    return client.models.generate_content_stream(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(**cfg),
+    )
+
+
+def stream_gemini(prompt):
+    """Yield the answer piece by piece (text appears quickly). Falls back to other models."""
+    models = [MODEL_NAME] + [m for m in FALLBACK_MODELS if m != MODEL_NAME]
     last_error = None
-    for model in models:
-        for attempt in range(2):
+    for round_no in range(2):
+        for model in models:
             try:
-                cfg = {"max_output_tokens": 1024}
-                if "gemini-3" in model:
-                    cfg["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
-                resp = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(**cfg),
-                )
-                if resp.text:
-                    return resp.text
+                got_text = False
+                for chunk in _stream_one(model, prompt):
+                    if chunk.text:
+                        got_text = True
+                        yield chunk.text
+                if got_text:
+                    return
             except Exception as e:
                 last_error = e
-                time.sleep(1.5)
+                if got_text:       # already showed part of the answer, stop here
+                    return
+        if round_no == 0:          # first round failed: also try models found for this key
+            models = [m for m in discover_models() if m not in models][:3]
+            if not models:
+                break
     raise last_error or RuntimeError("No response from AI")
 
 # Page settings
@@ -330,9 +383,9 @@ if uploaded_file is not None:
         )
         if len(rfm) >= 3:
             scaled = (rfm - rfm.mean()) / rfm.std().replace(0, 1)
-            rfm["Cluster"] = "Cluster " + KMeans(
-                n_clusters=3, n_init=10, random_state=42
-            ).fit_predict(scaled.fillna(0)).astype(str)
+            rfm["Cluster"] = "Cluster " + kmeans_labels(
+                scaled.fillna(0).values, k=3
+            ).astype(str)
             st.plotly_chart(
                 px.scatter(rfm.reset_index(), x="Frequency", y="Monetary",
                            color="Cluster", hover_data=["customer_id", "Recency"],
@@ -394,10 +447,8 @@ if uploaded_file is not None:
         with forecast_col:
             st.markdown("**Sales Forecast (next 3 months)**")
             if len(monthly_sales) >= 4:
-                y = monthly_sales["sales_amount"].values
-                X = np.arange(len(y)).reshape(-1, 1)
-                model = LinearRegression().fit(X, y)
-                preds = np.maximum(model.predict(np.arange(len(y), len(y) + 3).reshape(-1, 1)), 0)
+                preds, r2_score = linear_trend(monthly_sales["sales_amount"].values, 3)
+                preds = np.maximum(preds, 0)
                 last_period = pd.Period(monthly_sales["month"].max(), freq="M")
                 future_months = [(last_period + i).strftime("%Y-%m") for i in range(1, 4)]
                 forecast_df = pd.concat([
@@ -409,7 +460,7 @@ if uploaded_file is not None:
                             markers=True, title="Actual vs Forecast Revenue"),
                     width="stretch"
                 )
-                st.caption(f"Linear Regression trend model (R² = {model.score(X, y):.2f}). Indicative forecast, not a guarantee.")
+                st.caption(f"Linear Regression trend model (R² = {r2_score:.2f}). Indicative forecast, not a guarantee.")
             else:
                 st.info("At least 4 months of sales data are needed for the forecast.")
 
@@ -514,7 +565,7 @@ if uploaded_file is not None:
                 # Prepare conversation history
                 previous_chat = ""
 
-                for msg in st.session_state.retailiq_chat_history[-11:-1]:
+                for msg in st.session_state.retailiq_chat_history[-7:-1]:
                     previous_chat += (
                         f"\n{msg['role']}: {msg['content']}"
                     )
@@ -549,24 +600,22 @@ Business data:
 User question:
 {user_question}
 
-Give a concise, accurate and useful answer.
+Give a short, accurate answer (maximum 5-6 lines) unless the user asks for detail.
 """
 
 
                 # Generate AI response
                 with st.chat_message("assistant"):
-                    with st.spinner("RetailIQ AI is thinking..."):
+                    with st.container():
 
                         try:
                            
-                            answer = ask_gemini(ai_prompt)
+                            answer = st.write_stream(stream_gemini(ai_prompt))
 
 
 
                             if not answer:
                                 answer = "Sorry, I could not generate a response."
-
-                            st.markdown(answer)
 
                             st.session_state.retailiq_chat_history.append({
                                 "role": "assistant",
@@ -715,6 +764,7 @@ Give a concise, accurate and useful answer.
                 filtered["Estimated Net Profit"].sum()
             ]
         })
+        st.caption("Excel report includes the top 1,000 customers and the first 5,000 data rows (full data is available in the CSV download below).")
         if st.button("📊 Generate Excel Report"):
             
             # Excel report creation
@@ -746,11 +796,12 @@ Give a concise, accurate and useful answer.
                     writer, sheet_name="Monthly Growth", index=False
                 )
 
-                customer_report.to_excel(
+                # Large sheets are capped so the report is built quickly
+                customer_report.head(1000).to_excel(
                     writer, sheet_name="Customer Report", index=False
                 )
 
-                filtered.to_excel(
+                filtered.head(5000).to_excel(
                     writer, sheet_name="Filtered Data", index=False
                 )
                 if city_report is not None:
