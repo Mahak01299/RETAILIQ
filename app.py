@@ -1,4 +1,4 @@
-import sqlite3
+from datetime import datetime
 from io import BytesIO
 
 import numpy as np
@@ -119,7 +119,84 @@ def stream_gemini(prompt):
             models = [m for m in discover_models() if m not in models][:3]
             if not models:
                 break
+    # Last option: OpenAI API (only if OPENAI_API_KEY is added in secrets)
+    try:
+        openai_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        openai_key = ""
+    if openai_key:
+        yield from stream_openai(prompt, openai_key)
+        return
     raise last_error or RuntimeError("No response from AI")
+
+
+def stream_openai(prompt, api_key):
+    """Optional second AI provider (OpenAI API)."""
+    from openai import OpenAI
+    oc = OpenAI(api_key=api_key, timeout=25)
+    stream = oc.chat.completions.create(
+        model=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"),
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=800,
+        stream=True,
+    )
+    for ev in stream:
+        if ev.choices and ev.choices[0].delta.content:
+            yield ev.choices[0].delta.content
+
+
+# ---------------- DATABASE: SQLite by default, MySQL if MYSQL_URL is set in secrets ----------------
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    """Returns (engine, label). Example MYSQL_URL: mysql+pymysql://user:password@host:3306/dbname"""
+    from sqlalchemy import create_engine, text
+    try:
+        url = st.secrets.get("MYSQL_URL", "")
+    except Exception:
+        url = ""
+    if url:
+        try:
+            eng = create_engine(url, pool_pre_ping=True)
+            with eng.connect() as c:
+                c.execute(text("SELECT 1"))
+            return eng, "MySQL"
+        except Exception:
+            pass  # fall back to SQLite
+    return create_engine("sqlite:///retailiq.db"), "SQLite"
+
+
+def db_save_sales(df):
+    eng, _ = get_engine()
+    df.to_sql("sales", eng, if_exists="replace", index=False, chunksize=2000)
+
+
+def db_load_sales():
+    from sqlalchemy import inspect
+    eng, _ = get_engine()
+    if "sales" not in inspect(eng).get_table_names():
+        return None
+    return pd.read_sql_table("sales", eng)
+
+
+def log_event(event):
+    """Permanent usage log (stored in the database, survives page refresh)."""
+    from sqlalchemy import text
+    eng, _ = get_engine()
+    try:
+        with eng.begin() as c:
+            c.execute(text("CREATE TABLE IF NOT EXISTS usage_log (ts VARCHAR(30), event VARCHAR(50))"))
+            c.execute(text("INSERT INTO usage_log (ts, event) VALUES (:t, :e)"),
+                      {"t": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "e": event})
+    except Exception:
+        pass
+
+
+def read_usage_log():
+    eng, _ = get_engine()
+    try:
+        return pd.read_sql("SELECT ts, event FROM usage_log ORDER BY ts DESC", eng)
+    except Exception:
+        return pd.DataFrame(columns=["ts", "event"])
 
 # Page settings
 st.set_page_config(
@@ -135,52 +212,59 @@ st.caption("AI-Powered Retail Business Intelligence Platform")
 st.divider()
 
 # ---------------- ADMIN MODULE: login + usage monitoring ----------------
-if "usage" not in st.session_state:
-    st.session_state.usage = {"files_uploaded": 0, "ai_questions": 0, "reports_generated": 0}
 if "auth" not in st.session_state:
     st.session_state.auth = False
 
-if not st.session_state.auth:
-    st.subheader("🔐 Login")
-    st.caption("Demo login. Admin password is stored in secrets (ADMIN_PASSWORD).")
-    with st.form("login_form"):
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login", use_container_width=True)
-    if submitted:
-        if password.strip() == str(st.secrets.get("ADMIN_PASSWORD", "admin123")).strip():
-            st.session_state.auth = True
-            st.rerun()
-        else:
-            st.error("Wrong password")
-    st.stop()
 
-# Upload section is on the MAIN page so it works on mobile too
-up_col, out_col = st.columns([5, 1])
-with out_col:
-    if st.button("Logout"):
-        st.session_state.auth = False
-        st.rerun()
-
-with up_col:
-    st.subheader("📁 Upload Retail Data")
-
-uploaded_file = st.file_uploader(
-    "Upload CSV File",
-    type=["csv"]
+# Data source section is on the MAIN page so it works on mobile too
+st.subheader("📁 Data Source")
+_, db_label = get_engine()
+source = st.radio(
+    "Choose data source",
+    ["Upload CSV", f"Saved database ({db_label})"],
+    horizontal=True
 )
+use_db = source.startswith("Saved")
+
+raw_df = None
+data_name = ""
+uploaded_file = None
+
+if use_db:
+    try:
+        raw_df = db_load_sales()
+    except Exception as e:
+        st.error(f"Could not read the database: {e}")
+    if raw_df is None:
+        st.info("No data saved yet. Choose 'Upload CSV' once; every uploaded file is saved to the database automatically.")
+    else:
+        data_name = "database"
+        st.caption(f"Loaded {len(raw_df):,} rows from the {db_label} database.")
+        if st.button("🔄 Reload data from database"):
+            st.rerun()
+else:
+    uploaded_file = st.file_uploader(
+        "Upload CSV File",
+        type=["csv"]
+    )
+    if uploaded_file is None:
+        st.info("Upload a CSV file above to see the dashboard. A sample file is available in the project repo (sample_retail_data.csv).")
+    else:
+        try:
+            raw_df = pd.read_csv(uploaded_file)
+            data_name = uploaded_file.name
+        except Exception as e:
+            st.error(f"Could not read this CSV file: {e}")
 
 ai_access = st.toggle(
     "🤖 Enable AI Business Copilot",
     value=True
 )
 
-if uploaded_file is None:
-    st.info("Upload a CSV file above to see the dashboard. A sample file is available in the project repo (sample_retail_data.csv).")
-
-if uploaded_file is not None:
+if raw_df is not None:
 
     try:
-        df = pd.read_csv(uploaded_file)
+        df = raw_df.copy()
 
         required_columns = [
             "transaction_id",
@@ -217,12 +301,14 @@ if uploaded_file is not None:
             subset=["transaction_date", "sales_amount"]
         )
 
-        # DATABASE: store uploaded data in SQLite (can be swapped to MySQL later)
-        if st.session_state.get("last_file") != uploaded_file.name:
-            st.session_state.last_file = uploaded_file.name
-            st.session_state.usage["files_uploaded"] += 1
-            with sqlite3.connect("retailiq.db") as conn:
-                df.to_sql("sales", conn, if_exists="replace", index=False)
+        # DATABASE: every uploaded file is saved to the database (SQLite, or MySQL if configured)
+        if not use_db and st.session_state.get("last_file") != data_name:
+            st.session_state.last_file = data_name
+            log_event("file_upload")
+            try:
+                db_save_sales(df)
+            except Exception as e:
+                st.warning(f"Could not save data to the database: {e}")
 
         # Sidebar filters
         with st.expander("🔎 Filters (Region / Category)", expanded=False):
@@ -359,6 +445,37 @@ if uploaded_file is not None:
 
         st.plotly_chart(fig4, width="stretch")
 
+        # Top vs low performing products
+        st.subheader("Top vs Low Performing Products")
+        product_perf = (
+            filtered.groupby("product_name", as_index=False)
+            .agg(Revenue=("sales_amount", "sum"), Units_Sold=("quantity", "sum"))
+            .sort_values("Revenue", ascending=False)
+        )
+        product_perf["Performance"] = "Average"
+        if len(product_perf) >= 4:
+            q_hi = product_perf["Revenue"].quantile(0.75)
+            q_lo = product_perf["Revenue"].quantile(0.25)
+            product_perf.loc[product_perf["Revenue"] >= q_hi, "Performance"] = "Top performer"
+            product_perf.loc[product_perf["Revenue"] <= q_lo, "Performance"] = "Low performer"
+            pt, pl = st.columns(2)
+            pt.plotly_chart(
+                px.bar(product_perf.head(10).sort_values("Revenue"), x="Revenue", y="product_name",
+                       orientation="h", title="Top 10 Products by Revenue"),
+                width="stretch"
+            )
+            pl.plotly_chart(
+                px.bar(product_perf.tail(10).sort_values("Revenue", ascending=False), x="Revenue", y="product_name",
+                       orientation="h", title="Bottom 10 Products by Revenue"),
+                width="stretch"
+            )
+            n_low = int((product_perf["Performance"] == "Low performer").sum())
+            st.caption(f"Top performers = top 25% by revenue, low performers = bottom 25% ({n_low} products).")
+            with st.expander("Full product performance table"):
+                st.dataframe(product_perf, width="stretch", hide_index=True)
+        else:
+            st.info("At least 4 products are needed to compare top and low performers.")
+
         # Customer insights
         st.subheader("Customer Insights")
 
@@ -404,6 +521,37 @@ if uploaded_file is not None:
         else:
             st.info("At least 3 customers are needed for clustering.")
 
+        # Customer buying patterns
+        st.markdown("**Customer Buying Patterns**")
+        pc1, pc2 = st.columns(2)
+        weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        weekday_sales = (
+            filtered.assign(weekday=filtered["transaction_date"].dt.day_name())
+            .groupby("weekday", as_index=False)["sales_amount"].sum()
+        )
+        weekday_sales["weekday"] = pd.Categorical(weekday_sales["weekday"], weekday_order, ordered=True)
+        weekday_sales = weekday_sales.sort_values("weekday")
+        pc1.plotly_chart(
+            px.bar(weekday_sales, x="weekday", y="sales_amount", title="Revenue by Day of Week"),
+            width="stretch"
+        )
+        orders_per_customer = filtered.groupby("customer_id")["transaction_id"].nunique()
+        repeat_customers = int((orders_per_customer > 1).sum())
+        one_time_customers = int((orders_per_customer == 1).sum())
+        pc2.plotly_chart(
+            px.pie(names=["Repeat customers", "One-time customers"],
+                   values=[repeat_customers, one_time_customers],
+                   hole=0.4, title="Repeat vs One-time Customers"),
+            width="stretch"
+        )
+        st.markdown("**Top 10 Customers by Revenue**")
+        top_customers = (
+            filtered.groupby("customer_id", as_index=False)
+            .agg(Revenue=("sales_amount", "sum"), Orders=("transaction_id", "nunique"), Units=("quantity", "sum"))
+            .sort_values("Revenue", ascending=False).head(10)
+        )
+        st.dataframe(top_customers, width="stretch", hide_index=True)
+
         # Inventory status (uses actual stock data only when provided)
         st.subheader("Inventory Status")
         stock_column = next(
@@ -418,6 +566,11 @@ if uploaded_file is not None:
                 .agg(Available_Stock=(stock_column, "min"), Units_Sold=("quantity", "sum"))
                 .sort_values("Available_Stock")
             )
+            days_in_data = max((filtered["transaction_date"].max() - filtered["transaction_date"].min()).days + 1, 1)
+            inventory["Avg_Daily_Sales"] = (inventory["Units_Sold"] / days_in_data).round(2)
+            inventory["Days_Stock_Left"] = (
+                inventory["Available_Stock"] / inventory["Avg_Daily_Sales"].replace(0, np.nan)
+            ).replace([np.inf, -np.inf], np.nan).round(1)
             low_stock_limit = st.number_input(
                 "Low stock alert threshold", min_value=1, max_value=1000, value=10
             )
@@ -430,6 +583,21 @@ if uploaded_file is not None:
             else:
                 st.warning(f"{len(low_stock)} product(s) are at or below {low_stock_limit} units.")
                 st.dataframe(low_stock, width="stretch", hide_index=True)
+
+            # Restock suggestions based on average daily sales
+            plan_days = st.number_input(
+                "Restock planning window (days of demand to cover)", min_value=7, max_value=90, value=30
+            )
+            inventory["Suggested_Reorder_Qty"] = np.ceil(
+                np.maximum(inventory["Avg_Daily_Sales"] * plan_days - inventory["Available_Stock"], 0)
+            ).astype(int)
+            restock = inventory[inventory["Suggested_Reorder_Qty"] > 0].sort_values("Days_Stock_Left")
+            st.markdown(f"**Restock suggestions (to cover the next {plan_days} days)**")
+            if restock.empty:
+                st.success("Current stock is enough to cover the planning window.")
+            else:
+                st.dataframe(restock.head(15), width="stretch", hide_index=True)
+                st.caption("Suggested reorder quantity = average daily sales x planning days - available stock.")
         else:
             st.info(
                 "Inventory alerts need a stock_quantity (or inventory_quantity / stock) column in the uploaded CSV. "
@@ -444,6 +612,9 @@ if uploaded_file is not None:
             best_product = top_products.iloc[0]["product_name"] if not top_products.empty else None
             if best_product:
                 st.write(f"• Review replenishment for **{best_product}**, currently the top product by units sold.")
+            low_names = product_perf[product_perf["Performance"] == "Low performer"]["product_name"].tail(3).tolist()
+            if low_names:
+                st.write(f"• Consider discounts, bundling or delisting for low performers: **{', '.join(low_names)}**.")
             if len(category_sales) >= 2:
                 weakest_category = category_sales.iloc[-1]["category"]
                 st.write(f"• Review pricing, promotion, and assortment for **{weakest_category}**, the lowest-revenue category in the selected data.")
@@ -506,7 +677,7 @@ if uploaded_file is not None:
 
             if user_question:
 
-                st.session_state.usage["ai_questions"] += 1
+                log_event("ai_question")
                 st.session_state.retailiq_chat_history.append({
                     "role": "user",
                     "content": user_question
@@ -1154,18 +1325,56 @@ Give a short, accurate answer (maximum 5-6 lines) unless the user asks for detai
             on_click="ignore"
         )
 
+        def build_powerbi_csv():
+            pbi = filtered[[c for c in filtered.columns if not c.startswith("Estimated")]].copy()
+            pbi["Year"] = pbi["transaction_date"].dt.year
+            pbi["Month"] = pbi["transaction_date"].dt.month
+            pbi["Month_Name"] = pbi["transaction_date"].dt.month_name()
+            pbi["Weekday"] = pbi["transaction_date"].dt.day_name()
+            return pbi.to_csv(index=False).encode("utf-8")
+
+        st.markdown("**📈 Power BI**")
+        st.download_button(
+            "Download Power BI-ready dataset (CSV)",
+            data=build_powerbi_csv,
+            file_name="retailiq_powerbi_dataset.csv",
+            mime="text/csv",
+            on_click="ignore"
+        )
+        st.caption("In Power BI Desktop: Get Data > Text/CSV > select this file, then build your own dashboards.")
+
         st.success("RetailIQ dashboard and business reports loaded successfully!")
 
-        # ADMIN PANEL
-        with st.expander("🛠️ Admin Panel (Platform Usage & Data Source)"):
-            u = st.session_state.usage
-            a1, a2, a3 = st.columns(3)
-            a1.metric("Files uploaded", u["files_uploaded"])
-            a2.metric("AI questions asked", u["ai_questions"])
-            a3.metric("Reports generated", u["reports_generated"])
-            with sqlite3.connect("retailiq.db") as conn:
-                rows = conn.execute("SELECT COUNT(*) FROM sales").fetchone()[0]
-            st.write(f"Data source: SQLite database `retailiq.db`, table `sales` ({rows:,} rows).")
+        # ADMIN PANEL (password protected; the rest of the app is open to everyone)
+        with st.expander("🛠️ Admin Panel (password protected)"):
+            if not st.session_state.auth:
+                with st.form("admin_login"):
+                    admin_pw = st.text_input("Admin password", type="password")
+                    ok = st.form_submit_button("Unlock Admin Panel")
+                if ok:
+                    if admin_pw.strip() == str(st.secrets.get("ADMIN_PASSWORD", "admin123")).strip():
+                        st.session_state.auth = True
+                        st.rerun()
+                    else:
+                        st.error("Wrong password")
+            else:
+                usage_log = read_usage_log()
+                a1, a2, a3 = st.columns(3)
+                a1.metric("Files uploaded", int((usage_log["event"] == "file_upload").sum()))
+                a2.metric("AI questions asked", int((usage_log["event"] == "ai_question").sum()))
+                a3.metric("Total events", len(usage_log))
+                eng, db_name = get_engine()
+                try:
+                    n_rows = int(pd.read_sql("SELECT COUNT(*) AS n FROM sales", eng)["n"].iloc[0])
+                except Exception:
+                    n_rows = 0
+                st.write(f"Data source: **{db_name}** database, table `sales` ({n_rows:,} rows). Usage is stored permanently in table `usage_log`.")
+                if not usage_log.empty:
+                    st.markdown("**Recent activity**")
+                    st.dataframe(usage_log.head(15), width="stretch", hide_index=True)
+                if st.button("Lock Admin Panel"):
+                    st.session_state.auth = False
+                    st.rerun()
     except Exception as e:
         st.error(f"Unable to process dataset: {e}")
 
