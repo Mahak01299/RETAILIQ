@@ -79,7 +79,7 @@ def discover_models():
 
 
 def _stream_one(model, prompt):
-    cfg = {"max_output_tokens": 700}
+    cfg = {"max_output_tokens": 2500}  # thinking tokens also count, so keep this high
     if "gemini-3" in model:
         cfg["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
     return client.models.generate_content_stream(
@@ -97,10 +97,18 @@ def stream_gemini(prompt):
         for model in models:
             try:
                 got_text = False
+                hit_limit = False
                 for chunk in _stream_one(model, prompt):
                     if chunk.text:
                         got_text = True
                         yield chunk.text
+                    try:
+                        if "MAX_TOKENS" in str(chunk.candidates[0].finish_reason):
+                            hit_limit = True
+                    except Exception:
+                        pass
+                if got_text and hit_limit:
+                    yield "\n\n_(Answer was long and got cut. Ask: 'continue' or ask a narrower question.)_"
                 if got_text:
                     return
             except Exception as e:
@@ -535,6 +543,16 @@ if uploaded_file is not None:
                     .to_dict()
                 )
 
+                extra_context = ""
+                if "city" in filtered.columns:
+                    city_ai = filtered.groupby("city")["sales_amount"].sum().sort_values(ascending=False).head(10).to_dict()
+                    extra_context += f"\nTop Cities by Revenue:\n{city_ai}\n"
+                if "customer_segment" in filtered.columns:
+                    seg_ai = filtered.groupby("customer_segment")["sales_amount"].sum().to_dict()
+                    extra_context += f"\nRevenue by Customer Segment:\n{seg_ai}\n"
+                if stock_column:
+                    extra_context += f"\nLow stock products (stock <= {low_stock_limit}): {low_stock['product_name'].head(10).tolist()}\n"
+
                 business_context = f"""
                 RETAILIQ BUSINESS DATA:
 
@@ -554,11 +572,12 @@ if uploaded_file is not None:
 
                 Monthly Revenue:
                 {monthly_sales_ai}
+                {extra_context}
 
                 Important limitations:
                 - Only uploaded and currently filtered dataset is available.
-                - Profit/cost figures are illustrative assumptions, not real data.
-                - Do not claim simulated figures are actual business facts.
+                - All figures above are real figures from the uploaded file.
+                - Profit and cost are NOT in the data; do not state profit figures.
                 - Do not invent missing business information.
                 """
 
@@ -589,7 +608,7 @@ Use the provided RetailIQ data.
 Identify top products, sales, customers and regions.
 Give practical suggestions.
 Never invent business figures.
-Clearly identify simulated data.
+Do not add notes or disclaimers about simulated data; the figures given are real.
 
 Recent conversation:
 {previous_chat}
@@ -764,11 +783,8 @@ Give a short, accurate answer (maximum 5-6 lines) unless the user asks for detai
                 filtered["Estimated Net Profit"].sum()
             ]
         })
-        st.caption("Excel report includes the top 1,000 customers and the first 5,000 data rows (full data is available in the CSV download below).")
-        if st.button("📊 Generate Excel Report"):
-            
-            # Excel report creation
-            st.session_state.usage["reports_generated"] += 1
+        def build_excel_report():
+            """Builds the Excel file only when the user clicks Download."""
             excel_buffer = BytesIO()
 
             with pd.ExcelWriter(
@@ -1092,50 +1108,53 @@ Give a short, accurate answer (maximum 5-6 lines) unless the user asks for detai
             final_excel_buffer = BytesIO()
             wb.save(final_excel_buffer)
             excel_data = final_excel_buffer.getvalue()
+            return excel_data
 
-            st.write("Download your complete business report:")
+        st.caption("The Excel report includes the top 1,000 customers and the first 5,000 data rows. Full data is in the CSV downloads below.")
+        st.download_button(
+            label="📊 Download Complete Excel Report",
+            data=build_excel_report,
+            file_name="RetailIQ_Business_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click="ignore",
+        )
 
-            st.download_button(
-                label="📊 Download Complete Excel Report",
-                data=excel_data,
-                file_name="RetailIQ_Business_Report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
 
-            st.divider()
-            st.write("Download individual CSV reports:")
+        st.divider()
+        st.write("Download individual CSV reports:")
 
-            d1, d2, d3 = st.columns(3)
+        d1, d2, d3 = st.columns(3)
 
-            d1.download_button(
-                "Region Report CSV",
-                region_report.to_csv(index=False).encode("utf-8"),
-                "region_report.csv",
-                "text/csv"
-            )
+        d1.download_button(
+            "Region Report CSV",
+            region_report.to_csv(index=False).encode("utf-8"),
+            "region_report.csv",
+            "text/csv"
+        )
 
-            d2.download_button(
-                "Category Report CSV",
-                category_report.to_csv(index=False).encode("utf-8"),
-                "category_report.csv",
-                "text/csv"
-            )
+        d2.download_button(
+            "Category Report CSV",
+            category_report.to_csv(index=False).encode("utf-8"),
+            "category_report.csv",
+            "text/csv"
+        )
 
-            d3.download_button(
-                "Monthly Growth CSV",
-                monthly_report.to_csv(index=False).encode("utf-8"),
-                "monthly_growth.csv",
-                "text/csv"
-            )
+        d3.download_button(
+            "Monthly Growth CSV",
+            monthly_report.to_csv(index=False).encode("utf-8"),
+            "monthly_growth.csv",
+            "text/csv"
+        )
 
-            st.download_button(
-                "Download Complete Filtered CSV",
-                data=filtered.to_csv(index=False).encode("utf-8"),
-                file_name="retailiq_filtered_data.csv",
-                mime="text/csv"
-            )
+        st.download_button(
+            "Download Complete Filtered CSV",
+            data=lambda: filtered.to_csv(index=False).encode("utf-8"),
+            file_name="retailiq_filtered_data.csv",
+            mime="text/csv",
+            on_click="ignore"
+        )
 
-            st.success("RetailIQ dashboard and business reports loaded successfully!")
+        st.success("RetailIQ dashboard and business reports loaded successfully!")
 
         # ADMIN PANEL
         with st.expander("🛠️ Admin Panel (Platform Usage & Data Source)"):
