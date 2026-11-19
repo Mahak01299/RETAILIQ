@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -28,6 +29,28 @@ def linear_trend(y, steps=3):
     future = slope * np.arange(len(y), len(y) + steps) + intercept
     return future, r2
 
+
+
+# Charts: no zoom / pan (stops the page zooming on touch). Only the camera (download photo)
+# button stays; Streamlit's own fullscreen icon is left visible too.
+CHART_CONFIG = {
+    "displayModeBar": True,            # keep only the camera (download as photo) button
+    "modeBarButtons": [["toImage"]],
+    "toImageButtonOptions": {"format": "png", "filename": "retailiq_chart", "scale": 2},
+    "scrollZoom": False,
+    "doubleClick": False,
+    "showTips": False,
+    "displaylogo": False,
+}
+
+
+def plot_chart(target, fig, **kwargs):
+    """Shows a Plotly chart that cannot be zoomed or dragged; clicking bars still works."""
+    fig.update_layout(dragmode=False, hovermode="closest")
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
+    kwargs.setdefault("config", CHART_CONFIG)
+    return target.plotly_chart(fig, **kwargs)
 
 def clicked_labels(event, labels):
     """Labels of the bars / pie slices the user clicked on a Plotly chart (on_select event)."""
@@ -96,6 +119,48 @@ def scroll_to_element(element_id):
         except Exception:
             pass
 
+
+
+def read_any_table(uploaded):
+    """Reads CSV / TXT / Excel (xlsx, xls) / JSON uploads. Phones often give odd file types,
+    so the content is tried in several ways instead of trusting only the extension."""
+    name = (uploaded.name or "").lower()
+    raw = uploaded.getvalue()
+
+    def as_csv():
+        for enc in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                return pd.read_csv(BytesIO(raw), encoding=enc, sep=None, engine="python")
+            except Exception:
+                continue
+        raise ValueError("not a readable CSV")
+
+    def as_excel():
+        sheets = pd.read_excel(BytesIO(raw), sheet_name=None)
+        # use the sheet that has the sales columns (e.g. 'Filtered Data' in a RetailIQ report)
+        for sheet_df in sheets.values():
+            if {"transaction_id", "sales_amount"}.issubset(sheet_df.columns):
+                return sheet_df
+        return next(iter(sheets.values()))
+
+    def as_json():
+        return pd.read_json(BytesIO(raw))
+
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        order = [as_excel, as_csv]
+    elif name.endswith(".json"):
+        order = [as_json, as_csv]
+    else:
+        order = [as_csv, as_excel, as_json]
+    last = None
+    for reader in order:
+        try:
+            df_read = reader()
+            if df_read is not None and len(df_read.columns) > 1:
+                return df_read
+        except Exception as e:
+            last = e
+    raise ValueError(f"Unsupported or unreadable file ({last})")
 
 # Gemini client (key is read from .streamlit/secrets.toml)
 client = genai.Client(
@@ -278,6 +343,31 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+
+# Keep touch scrolling smooth over charts
+st.markdown(
+    """
+    <style>
+    /* Finger on a chart = scroll the PAGE only. No pinch zoom, no double-tap zoom, no dragging the graph */
+    .js-plotly-plot, .js-plotly-plot *,
+    [data-testid="stPlotlyChart"], [data-testid="stPlotlyChart"] * {
+        touch-action: pan-y !important;
+        -webkit-user-select: none; user-select: none;
+        -webkit-tap-highlight-color: transparent;
+    }
+    html, body { overscroll-behavior-x: none; }
+    /* Chart toolbar: show ONLY the download-image (camera) button */
+    .modebar-group .modebar-btn { display: none !important; }
+    .modebar-group .modebar-btn[data-title*="png" i],
+    .modebar-group .modebar-btn[data-title*="image" i] { display: inline-block !important; }
+    /* Streamlit toolbar: keep fullscreen, hide search / download icons (tables) */
+    [data-testid="stElementToolbarButton"][aria-label*="earch" i],
+    [data-testid="stElementToolbarButton"][aria-label*="ownload" i] { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Custom title
 st.title("📊 RetailIQ")
 st.caption("AI-Powered Retail Business Intelligence Platform")
@@ -293,10 +383,11 @@ st.subheader("📁 Data Source")
 _, db_label = get_engine()
 source = st.radio(
     "Choose data source",
-    ["Upload CSV", f"Saved database ({db_label})"],
+    ["Upload CSV", "Use demo data (no upload needed)", f"Saved database ({db_label})"],
     horizontal=True
 )
 use_db = source.startswith("Saved")
+use_demo = source.startswith("Use demo")
 
 raw_df = None
 data_name = ""
@@ -314,19 +405,27 @@ if use_db:
         st.caption(f"Loaded {len(raw_df):,} rows from the {db_label} database.")
         if st.button("🔄 Reload data from database"):
             st.rerun()
+elif use_demo:
+    demo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "retailiq_demo_with_inventory.csv")
+    if os.path.exists(demo_path):
+        raw_df = pd.read_csv(demo_path)
+        data_name = "demo data"
+        st.caption(f"Using built-in demo data ({len(raw_df):,} rows) with city, customer name and stock columns.")
+    else:
+        st.error("Demo file 'retailiq_demo_with_inventory.csv' was not found next to app.py. Add it to the GitHub repo.")
 else:
+    # No 'type' filter on purpose: phone file pickers grey out files when a type list is set.
     uploaded_file = st.file_uploader(
-        "Upload CSV File",
-        type=["csv"]
+        "Upload your data file (CSV or Excel - any file type works)"
     )
     if uploaded_file is None:
         st.info("Upload a CSV file above to see the dashboard. A sample file is available in the project repo (sample_retail_data.csv).")
     else:
         try:
-            raw_df = pd.read_csv(uploaded_file)
+            raw_df = read_any_table(uploaded_file)
             data_name = uploaded_file.name
         except Exception as e:
-            st.error(f"Could not read this CSV file: {e}")
+            st.error(f"Could not read this file: {e}")
 
 ai_access = st.toggle(
     "🤖 Enable AI Business Copilot",
@@ -443,7 +542,7 @@ if raw_df is not None:
             color="category"
         )
 
-        left.plotly_chart(fig1, width="stretch")
+        plot_chart(left, fig1, width="stretch")
 
         region_sales = (
             filtered.groupby("region", as_index=False)
@@ -458,7 +557,7 @@ if raw_df is not None:
             hole=0.4
         )
 
-        right.plotly_chart(fig2, width="stretch")
+        plot_chart(right, fig2, width="stretch")
 
         # Monthly trend
         st.subheader("Monthly Sales Trend")
@@ -480,7 +579,7 @@ if raw_df is not None:
             title="Monthly Revenue Trend"
         )
 
-        st.plotly_chart(fig3, width="stretch")
+        plot_chart(st, fig3, width="stretch")
 
         # City-wise performance (real city column from the CSV)
         st.subheader("City-wise Performance")
@@ -489,7 +588,7 @@ if raw_df is not None:
                 filtered.groupby("city", as_index=False)["sales_amount"]
                 .sum().sort_values("sales_amount", ascending=False)
             )
-            st.plotly_chart(
+            plot_chart(st, 
                 px.bar(city_sales.head(10), x="city", y="sales_amount",
                        title="Top 10 Cities by Revenue", color="city"),
                 width="stretch"
@@ -515,7 +614,7 @@ if raw_df is not None:
             title="Top 10 Products by Units Sold"
         )
 
-        st.plotly_chart(fig4, width="stretch")
+        plot_chart(st, fig4, width="stretch")
 
         # Top vs low performing products
         st.subheader("Top vs Low Performing Products")
@@ -536,7 +635,7 @@ if raw_df is not None:
             with pt:
                 st.markdown("#### 🏆 Top 10 Best-Performing Products")
                 st.caption("These products earn the HIGHEST revenue.")
-                st.plotly_chart(
+                plot_chart(st, 
                     px.bar(top10, x="Revenue", y="product_name", orientation="h",
                            hover_data=["Units_Sold"], color_discrete_sequence=["#2ECC71"],
                            labels={"product_name": "Product"}),
@@ -545,7 +644,7 @@ if raw_df is not None:
             with pl:
                 st.markdown("#### 📉 Top 10 Low-Performing Products")
                 st.caption("These products earn the LOWEST revenue.")
-                st.plotly_chart(
+                plot_chart(st, 
                     px.bar(low10, x="Revenue", y="product_name", orientation="h",
                            hover_data=["Units_Sold"], color_discrete_sequence=["#E74C3C"],
                            labels={"product_name": "Product"}),
@@ -569,7 +668,7 @@ if raw_df is not None:
             )
             seg_labels = customer_segments["customer_segment"].tolist()
             st.caption("👆 Click any bar to see the customers (ID, name, orders, revenue) in that segment.")
-            seg_event = st.plotly_chart(
+            seg_event = plot_chart(st, 
                 px.bar(customer_segments, x="customer_segment", y="sales_amount",
                        title="Revenue by Customer Segment",
                        labels={"customer_segment": "Customer segment", "sales_amount": "Revenue"}),
@@ -602,7 +701,7 @@ if raw_df is not None:
         weekday_sales = weekday_sales.sort_values("weekday")
         weekday_labels = weekday_sales["weekday"].astype(str).tolist()
         with pc1:
-            weekday_event = st.plotly_chart(
+            weekday_event = plot_chart(st, 
                 px.bar(weekday_sales, x="weekday", y="sales_amount", title="Revenue by Day of Week",
                        labels={"weekday": "Day", "sales_amount": "Revenue"}),
                 width="stretch", on_select="rerun", selection_mode="points", key="weekday_chart"
@@ -615,7 +714,7 @@ if raw_df is not None:
                          hole=0.4, title="Repeat vs One-time Customers")
         pie_fig.update_traces(sort=False)
         with pc2:
-            pie_event = st.plotly_chart(
+            pie_event = plot_chart(st, 
                 pie_fig, width="stretch", on_select="rerun", selection_mode="points", key="repeat_chart"
             )
 
@@ -699,12 +798,12 @@ if raw_df is not None:
                     .sort_values("Total_Stock", ascending=False)
                 )
                 ci1, ci2 = st.columns(2)
-                ci1.plotly_chart(
+                plot_chart(ci1, 
                     px.bar(city_stock, x="city", y="Total_Stock", title="Total Stock by City",
                            labels={"city": "City", "Total_Stock": "Units in stock"}),
                     width="stretch"
                 )
-                ci2.plotly_chart(
+                plot_chart(ci2, 
                     px.bar(city_stock.sort_values("Low_Stock_Items", ascending=False),
                            x="city", y="Low_Stock_Items", title="Low-stock Items by City",
                            color_discrete_sequence=["#E74C3C"],
@@ -771,7 +870,7 @@ if raw_df is not None:
                     monthly_sales.assign(type="Actual"),
                     pd.DataFrame({"month": future_months, "sales_amount": preds, "type": "Forecast"}),
                 ])
-                st.plotly_chart(
+                plot_chart(st, 
                     px.line(forecast_df, x="month", y="sales_amount", color="type",
                             markers=True, title="Actual vs Forecast Revenue"),
                     width="stretch"
