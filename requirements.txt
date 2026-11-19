@@ -5,3 +5,6 @@ plotly
 scikit-learn
 openpyxl
 google-genai
+sqlalchemy
+pymysql
+openai
