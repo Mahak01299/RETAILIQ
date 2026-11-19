@@ -1,44 +1,20 @@
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+import time
 from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 from openpyxl import load_workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-
-# scikit-learn is optional: if it is blocked/missing (e.g. Windows policy), numpy fallbacks are used
-try:
-    from sklearn.cluster import KMeans as _SkKMeans
-    SKLEARN_OK = True
-except Exception:
-    SKLEARN_OK = False
-
-
-def kmeans_labels(data, k=3, iters=50, seed=42):
-    """Cluster labels using scikit-learn KMeans, or a simple numpy KMeans if unavailable."""
-    data = np.asarray(data, dtype=float)
-    if SKLEARN_OK:
-        return _SkKMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(data)
-    rng = np.random.default_rng(seed)
-    centers = data[rng.choice(len(data), k, replace=False)]
-    for _ in range(iters):
-        dist = ((data[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        labels = dist.argmin(axis=1)
-        new = np.array([data[labels == i].mean(axis=0) if (labels == i).any() else centers[i]
-                        for i in range(k)])
-        if np.allclose(new, centers):
-            break
-        centers = new
-    return labels
-
 
 def linear_trend(y, steps=3):
     """Least-squares Linear Regression on time index. Returns predictions and R-squared."""
@@ -51,6 +27,75 @@ def linear_trend(y, steps=3):
     r2 = 1 - ss_res / ss_tot if ss_tot else 1.0
     future = slope * np.arange(len(y), len(y) + steps) + intercept
     return future, r2
+
+
+def clicked_labels(event, labels):
+    """Labels of the bars / pie slices the user clicked on a Plotly chart (on_select event)."""
+    try:
+        points = event.selection.points
+    except Exception:
+        return []
+    labels = list(labels)
+    found = []
+    for pt in points:
+        idx = pt.get("point_index", pt.get("point_number"))
+        if isinstance(idx, int) and 0 <= idx < len(labels):
+            found.append(labels[idx])
+        else:
+            val = pt.get("x", pt.get("label"))
+            if val in labels:
+                found.append(val)
+    return list(dict.fromkeys(found))
+
+
+def show_customer_table(data, title, key):
+    """Customer list (ID, optional name, orders, units, revenue) for the clicked bar / slice."""
+    st.markdown(f"##### 👥 {title}")
+    if data.empty:
+        st.info("No customers found for this selection.")
+        return
+    group_cols = ["customer_id"] + (["customer_name"] if "customer_name" in data.columns else [])
+    table = (
+        data.groupby(group_cols, as_index=False)
+        .agg(Orders=("transaction_id", "nunique"), Units=("quantity", "sum"),
+             Revenue=("sales_amount", "sum"), Last_Purchase=("transaction_date", "max"))
+        .sort_values("Revenue", ascending=False)
+    )
+    table["Revenue"] = table["Revenue"].round(2)
+    table["Last_Purchase"] = table["Last_Purchase"].dt.strftime("%Y-%m-%d")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Customers", f"{len(table):,}")
+    m2.metric("Orders", f"{int(table['Orders'].sum()):,}")
+    m3.metric("Revenue", f"{table['Revenue'].sum():,.0f}")
+    st.dataframe(table.head(100), width="stretch", hide_index=True)
+    st.caption(f"Showing top {min(len(table), 100)} of {len(table):,} customers by revenue.")
+    st.download_button(
+        f"⬇️ Download all {len(table):,} customers (CSV)",
+        table.to_csv(index=False).encode("utf-8"),
+        file_name=f"{key}.csv", mime="text/csv", key=f"dl_{key}",
+    )
+
+
+def scroll_to_element(element_id):
+    """Scrolls the page to the element with this id (used so the AI answer comes into view)."""
+    js = f"""
+    <script>
+    // run {time.time_ns()}
+    function go() {{
+        const el = window.parent.document.getElementById("{element_id}");
+        if (el) el.scrollIntoView({{behavior: "smooth", block: "start"}});
+    }}
+    [0, 250, 700, 1500].forEach(t => setTimeout(go, t));
+    </script>
+    """
+    try:
+        components.html(js, height=0)
+    except Exception:
+        try:
+            st.html(js, unsafe_allow_javascript=True)
+        except Exception:
+            pass
+
 
 # Gemini client (key is read from .streamlit/secrets.toml)
 client = genai.Client(
@@ -485,17 +530,27 @@ if raw_df is not None:
             q_lo = product_perf["Revenue"].quantile(0.25)
             product_perf.loc[product_perf["Revenue"] >= q_hi, "Performance"] = "Top performer"
             product_perf.loc[product_perf["Revenue"] <= q_lo, "Performance"] = "Low performer"
+            top10 = product_perf.head(10).sort_values("Revenue")
+            low10 = product_perf.tail(10).sort_values("Revenue", ascending=False)
             pt, pl = st.columns(2)
-            pt.plotly_chart(
-                px.bar(product_perf.head(10).sort_values("Revenue"), x="Revenue", y="product_name",
-                       orientation="h", title="Top 10 Products by Revenue"),
-                width="stretch"
-            )
-            pl.plotly_chart(
-                px.bar(product_perf.tail(10).sort_values("Revenue", ascending=False), x="Revenue", y="product_name",
-                       orientation="h", title="Bottom 10 Products by Revenue"),
-                width="stretch"
-            )
+            with pt:
+                st.markdown("#### 🏆 Top 10 Best-Performing Products")
+                st.caption("These products earn the HIGHEST revenue.")
+                st.plotly_chart(
+                    px.bar(top10, x="Revenue", y="product_name", orientation="h",
+                           hover_data=["Units_Sold"], color_discrete_sequence=["#2ECC71"],
+                           labels={"product_name": "Product"}),
+                    width="stretch"
+                )
+            with pl:
+                st.markdown("#### 📉 Top 10 Low-Performing Products")
+                st.caption("These products earn the LOWEST revenue.")
+                st.plotly_chart(
+                    px.bar(low10, x="Revenue", y="product_name", orientation="h",
+                           hover_data=["Units_Sold"], color_discrete_sequence=["#E74C3C"],
+                           labels={"product_name": "Product"}),
+                    width="stretch"
+                )
             n_low = int((product_perf["Performance"] == "Low performer").sum())
             st.caption(f"Top performers = top 25% by revenue, low performers = bottom 25% ({n_low} products).")
             with st.expander("Full product performance table"):
@@ -512,68 +567,86 @@ if raw_df is not None:
                 ["sales_amount"].sum()
                 .sort_values("sales_amount", ascending=False)
             )
-
-            st.plotly_chart(
-                px.bar(
-                    customer_segments,
-                    x="customer_segment",
-                    y="sales_amount",
-                    title="Revenue by Customer Segment"
-                ),
-                width="stretch"
+            seg_labels = customer_segments["customer_segment"].tolist()
+            st.caption("👆 Click any bar to see the customers (ID, name, orders, revenue) in that segment.")
+            seg_event = st.plotly_chart(
+                px.bar(customer_segments, x="customer_segment", y="sales_amount",
+                       title="Revenue by Customer Segment",
+                       labels={"customer_segment": "Customer segment", "sales_amount": "Revenue"}),
+                width="stretch", on_select="rerun", selection_mode="points", key="segment_chart"
             )
+            seg_pick = clicked_labels(seg_event, seg_labels)
+            if not seg_pick:
+                chosen = st.selectbox("Or choose a segment from the list",
+                                      ["— Select —"] + seg_labels, key="segment_select")
+                seg_pick = [] if chosen == "— Select —" else [chosen]
+            if seg_pick:
+                show_customer_table(
+                    filtered[filtered["customer_segment"].isin(seg_pick)],
+                    f"Customers in segment: {', '.join(map(str, seg_pick))}", "segment_customers"
+                )
         else:
             st.info("Add a customer_segment column to the CSV to view segment-level customer insights.")
 
-        # AI customer clustering: RFM + KMeans
-        st.markdown("**AI Customer Clusters (RFM + KMeans)**")
-        snapshot = filtered["transaction_date"].max()
-        rfm = filtered.groupby("customer_id").agg(
-            Recency=("transaction_date", lambda x: (snapshot - x.max()).days),
-            Frequency=("transaction_id", "nunique"),
-            Monetary=("sales_amount", "sum"),
-        )
-        if len(rfm) >= 3:
-            scaled = (rfm - rfm.mean()) / rfm.std().replace(0, 1)
-            rfm["Cluster"] = "Cluster " + kmeans_labels(
-                scaled.fillna(0).values, k=3
-            ).astype(str)
-            st.plotly_chart(
-                px.scatter(rfm.reset_index(), x="Frequency", y="Monetary",
-                           color="Cluster", hover_data=["customer_id", "Recency"],
-                           title="Customer Segments"),
-                width="stretch"
-            )
-            st.caption("Customers grouped by Recency, Frequency and Monetary value using KMeans.")
-        else:
-            st.info("At least 3 customers are needed for clustering.")
-
         # Customer buying patterns
-        st.markdown("**Customer Buying Patterns**")
+        st.subheader("Customer Buying Patterns")
+        st.caption("👆 Click a bar or a pie slice to see the customers behind it.")
         pc1, pc2 = st.columns(2)
         weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        day_names = filtered["transaction_date"].dt.day_name()
         weekday_sales = (
-            filtered.assign(weekday=filtered["transaction_date"].dt.day_name())
+            filtered.assign(weekday=day_names)
             .groupby("weekday", as_index=False)["sales_amount"].sum()
         )
         weekday_sales["weekday"] = pd.Categorical(weekday_sales["weekday"], weekday_order, ordered=True)
         weekday_sales = weekday_sales.sort_values("weekday")
-        pc1.plotly_chart(
-            px.bar(weekday_sales, x="weekday", y="sales_amount", title="Revenue by Day of Week"),
-            width="stretch"
-        )
+        weekday_labels = weekday_sales["weekday"].astype(str).tolist()
+        with pc1:
+            weekday_event = st.plotly_chart(
+                px.bar(weekday_sales, x="weekday", y="sales_amount", title="Revenue by Day of Week",
+                       labels={"weekday": "Day", "sales_amount": "Revenue"}),
+                width="stretch", on_select="rerun", selection_mode="points", key="weekday_chart"
+            )
         orders_per_customer = filtered.groupby("customer_id")["transaction_id"].nunique()
-        repeat_customers = int((orders_per_customer > 1).sum())
-        one_time_customers = int((orders_per_customer == 1).sum())
-        pc2.plotly_chart(
-            px.pie(names=["Repeat customers", "One-time customers"],
-                   values=[repeat_customers, one_time_customers],
-                   hole=0.4, title="Repeat vs One-time Customers"),
-            width="stretch"
-        )
+        repeat_ids = orders_per_customer[orders_per_customer > 1].index
+        one_time_ids = orders_per_customer[orders_per_customer == 1].index
+        pie_labels = ["Repeat customers", "One-time customers"]
+        pie_fig = px.pie(names=pie_labels, values=[len(repeat_ids), len(one_time_ids)],
+                         hole=0.4, title="Repeat vs One-time Customers")
+        pie_fig.update_traces(sort=False)
+        with pc2:
+            pie_event = st.plotly_chart(
+                pie_fig, width="stretch", on_select="rerun", selection_mode="points", key="repeat_chart"
+            )
+
+        day_pick = clicked_labels(weekday_event, weekday_labels)
+        if day_pick:
+            day_data = filtered[day_names.isin(day_pick)]
+            show_customer_table(day_data, f"Customers who bought on: {', '.join(day_pick)}", "weekday_customers")
+            day_products = (
+                day_data.groupby("product_name", as_index=False)
+                .agg(Units=("quantity", "sum"), Revenue=("sales_amount", "sum"))
+                .sort_values("Revenue", ascending=False).head(10)
+            )
+            st.markdown(f"**Top 10 products sold on {', '.join(day_pick)}**")
+            st.dataframe(day_products, width="stretch", hide_index=True)
+
+        group_pick = clicked_labels(pie_event, pie_labels)
+        if group_pick:
+            ids = []
+            if "Repeat customers" in group_pick:
+                ids += list(repeat_ids)
+            if "One-time customers" in group_pick:
+                ids += list(one_time_ids)
+            show_customer_table(
+                filtered[filtered["customer_id"].isin(ids)],
+                f"{' + '.join(group_pick)}", "repeat_vs_onetime_customers"
+            )
+
         st.markdown("**Top 10 Customers by Revenue**")
+        top_group = ["customer_id"] + (["customer_name"] if "customer_name" in filtered.columns else [])
         top_customers = (
-            filtered.groupby("customer_id", as_index=False)
+            filtered.groupby(top_group, as_index=False)
             .agg(Revenue=("sales_amount", "sum"), Orders=("transaction_id", "nunique"), Units=("quantity", "sum"))
             .sort_values("Revenue", ascending=False).head(10)
         )
@@ -588,9 +661,13 @@ if raw_df is not None:
         if stock_column:
             stock_data = filtered.copy()
             stock_data[stock_column] = pd.to_numeric(stock_data[stock_column], errors="coerce")
+            stock_data = stock_data.dropna(subset=[stock_column]).sort_values("transaction_date")
+            has_city = "city" in stock_data.columns
+            inv_keys = ["product_name", "category"] + (["city"] if has_city else [])
+            # latest known stock for every product (and every city, when a city column exists)
             inventory = (
-                stock_data.groupby(["product_name", "category"], as_index=False)
-                .agg(Available_Stock=(stock_column, "min"), Units_Sold=("quantity", "sum"))
+                stock_data.groupby(inv_keys, as_index=False)
+                .agg(Available_Stock=(stock_column, "last"), Units_Sold=("quantity", "sum"))
                 .sort_values("Available_Stock")
             )
             days_in_data = max((filtered["transaction_date"].max() - filtered["transaction_date"].min()).days + 1, 1)
@@ -602,14 +679,46 @@ if raw_df is not None:
                 "Low stock alert threshold", min_value=1, max_value=1000, value=10
             )
             low_stock = inventory[inventory["Available_Stock"] <= low_stock_limit]
+            item_word = "Product-city items" if has_city else "Products"
             i1, i2 = st.columns(2)
-            i1.metric("Products tracked", f"{len(inventory):,}")
-            i2.metric("Low stock products", f"{len(low_stock):,}")
+            i1.metric(f"{item_word} tracked", f"{len(inventory):,}")
+            i2.metric("Low stock items", f"{len(low_stock):,}")
             if low_stock.empty:
                 st.success("No products are below the selected stock threshold.")
             else:
-                st.warning(f"{len(low_stock)} product(s) are at or below {low_stock_limit} units.")
+                st.warning(f"{len(low_stock)} item(s) are at or below {low_stock_limit} units.")
                 st.dataframe(low_stock, width="stretch", hide_index=True)
+
+            # City-wise inventory
+            st.markdown("**City-wise Inventory**")
+            if has_city:
+                city_stock = (
+                    inventory.groupby("city", as_index=False)
+                    .agg(Total_Stock=("Available_Stock", "sum"),
+                         Low_Stock_Items=("Available_Stock", lambda x: int((x <= low_stock_limit).sum())))
+                    .sort_values("Total_Stock", ascending=False)
+                )
+                ci1, ci2 = st.columns(2)
+                ci1.plotly_chart(
+                    px.bar(city_stock, x="city", y="Total_Stock", title="Total Stock by City",
+                           labels={"city": "City", "Total_Stock": "Units in stock"}),
+                    width="stretch"
+                )
+                ci2.plotly_chart(
+                    px.bar(city_stock.sort_values("Low_Stock_Items", ascending=False),
+                           x="city", y="Low_Stock_Items", title="Low-stock Items by City",
+                           color_discrete_sequence=["#E74C3C"],
+                           labels={"city": "City", "Low_Stock_Items": "Low-stock items"}),
+                    width="stretch"
+                )
+                pick_city = st.selectbox(
+                    "View stock of a city", ["All cities"] + sorted(inventory["city"].dropna().unique().tolist()),
+                    key="inventory_city"
+                )
+                city_view = inventory if pick_city == "All cities" else inventory[inventory["city"] == pick_city]
+                st.dataframe(city_view.sort_values("Available_Stock"), width="stretch", hide_index=True)
+            else:
+                st.info("Add a 'city' column to the CSV to see city-wise inventory.")
 
             # Restock suggestions based on average daily sales
             plan_days = st.number_input(
@@ -627,8 +736,9 @@ if raw_df is not None:
                 st.caption("Suggested reorder quantity = average daily sales x planning days - available stock.")
         else:
             st.info(
-                "Inventory alerts need a stock_quantity (or inventory_quantity / stock) column in the uploaded CSV. "
-                "Sales quantity alone cannot confirm current stock."
+                "Inventory needs a stock_quantity (or inventory_quantity / stock) column in the CSV, "
+                "and a city column for city-wise inventory. Upload retailiq_demo_with_inventory.csv, "
+                "or run enrich_retail_csv.py on your own file to add them."
             )
 
         # Simple, explainable recommendations and demand estimate
@@ -675,6 +785,7 @@ if raw_df is not None:
         # =====================================
 
         st.divider()
+        st.markdown('<div id="retailiq-copilot" style="scroll-margin-top:80px"></div>', unsafe_allow_html=True)
         st.header("🤖 RetailIQ AI Business Copilot")
 
         st.caption(
@@ -709,6 +820,10 @@ if raw_df is not None:
                     "role": "user",
                     "content": user_question
                 })
+
+                # Take the person to the answer: scroll from wherever they typed down to the chat
+                st.markdown('<div id="retailiq-latest" style="scroll-margin-top:90px"></div>', unsafe_allow_html=True)
+                scroll_to_element("retailiq-latest")
 
                 with st.chat_message("user"):
                     st.markdown(user_question)
@@ -845,7 +960,7 @@ Give a short, accurate answer (maximum 5-6 lines) unless the user asks for detai
                             )
 
         else:
-            st.info("Enable AI Assistant from the sidebar to start chatting.")
+            st.info("Turn on 'Enable AI Business Copilot' (near the top of the page) to start chatting.")
 
         # Data preview
         with st.expander("View Uploaded Data"):
